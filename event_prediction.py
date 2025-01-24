@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import xgboost as xgb
 # from sklearn.datasets import load_iris
@@ -8,20 +9,26 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, precision_score, f1_score
 
+from pytorch_tabnet.tab_model import TabNetClassifier, TabNetRegressor
+from tabpfn import TabPFNClassifier
+
 # train_data_path = '../../dataset/table_data/adult/adult_new.csv'
 # test_data_path = '../../dataset/table_data/adult/adult_test.csv'
 
 # train_data_path = '../../dataset/table_data/Abalone/Abalone_data_train.csv'
 # test_data_path = '../../dataset/table_data/Abalone/Abalone_data_test.csv'
 
-train_data_path = '../../dataset/table_data/arrhythmia/arrhythmia_train.csv'
-test_data_path = '../../dataset/table_data/arrhythmia/arrhythmia_test.csv'
+# train_data_path = '../../dataset/table_data/arrhythmia/arrhythmia_train.csv'
+# test_data_path = '../../dataset/table_data/arrhythmia/arrhythmia_test.csv'
 
 # train_data_path = '../../dataset/table_data/CCS/CCS_Data_train.csv'
 # test_data_path = '../../dataset/table_data/CCS/CCS_Data_test.csv'
 
 # train_data_path = '../../dataset/table_data/auto-mpg/Auto-mpg_Data_train.csv'
 # test_data_path = '../../dataset/table_data/auto-mpg/Auto-mpg_Data_test.csv'
+
+train_data_path = '../../dataset/table_data/liver_disorders/liver_disorder_Data_train.csv'
+test_data_path = '../../dataset/table_data/liver_disorders/liver_disorder_Data_test.csv'
 
 data_train = pd.read_csv(train_data_path, encoding='utf-8')
 data_test = pd.read_csv(test_data_path, encoding='utf-8')
@@ -191,8 +198,60 @@ def test_logistic(x_train, y_train, x_test, y_test):
     print(class_report)
 
 
+def test_tabnet(x_train,y_train,x_test,y_test):
+    X_train, X_valid, Y_train, y_valid = train_test_split(x_train, y_train, test_size=0.2, random_state=42)
+    clf = TabNetClassifier()  # TabNetRegressor()
+    clf.fit(
+        np.array(X_train), np.array(Y_train),
+        eval_set=[(np.array(X_valid), np.array(y_valid))]
+    )
+    y_pred = clf.predict(np.array(x_test))
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+    class_report = classification_report(y_test, y_pred)
+
+    print('tabnet')
+    print(f'Accuracy: {accuracy:.2f}')
+    print(f'Precision:{precision:.2f}')
+    print(f'F1:{f1:.2f}')
+    print('Confusion Matrix:')
+    print(conf_matrix)
+    print('Classification Report:')
+    print(class_report)
+
+def test_tabpfn(x_train,y_train,x_test,y_test):
+    classifier = TabPFNClassifier(device='cpu', N_ensemble_configurations=32)
+
+    classifier.fit(x_train, y_train)
+    y_pred, p_eval = classifier.predict(x_test, return_winning_probability=True)
+
+    # Evaluate the model
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+    class_report = classification_report(y_test, y_pred)
+
+    print('tabpfn')
+    print(f'Accuracy: {accuracy:.2f}')
+    print(f'Precision:{precision:.2f}')
+    print(f'F1:{f1:.2f}')
+    print('Confusion Matrix:')
+    print(conf_matrix)
+    print('Classification Report:')
+    print(class_report)
+
+
 test_xgboost(x_train, y_train, x_test, y_test)
 test_SVC(x_train, y_train, x_test, y_test)
 test_randomforest(x_train, y_train, x_test, y_test)
 test_neural_network(x_train, y_train, x_test, y_test)
 test_logistic(x_train, y_train, x_test, y_test)
+
+
+test_tabnet(x_train,y_train, x_test, y_test)
+test_tabpfn(x_train, y_train, x_test, y_test)
