@@ -9,32 +9,12 @@ from castle.algorithms import PC, Notears, ICALiNGAM, DirectLiNGAM, RL
 
 from algorithm.utils.evaluation import MetricGenenral
 
-# data_path = '../../dataset/table_data/Abalone/Abalone_Data.csv'
-# ground_truth_path = '../../dataset/table_data/Abalone/Abalone_data_ground_truth.csv'
-# dataname = 'abalone'
-
-# data_path = '../../dataset/table_data/CCS/CCS_Data.csv'
-# ground_truth_path = '../../dataset/table_data/CCS/CCS_Data_ground_truth.csv'
-# dataname = 'ccs'
+dir_path='/workspace/causal_discovery/dataset/real_world/'
+data_name='CCS'
+ground_truth_path=dir_path+f'{data_name}/{data_name}_Data_ground_truth.csv'
 
 
-# data_path = '../../dataset/table_data/auto-mpg/Auto-mpg_Data.csv'
-# ground_truth_path = '../../dataset/table_data/auto-mpg/Auto-mpg_Data_groung_truth.csv'
-# dataname='autompg'
-
-data_path = '../../dataset/table_data/liver_disorders/liver_disorder_Data.csv'
-ground_truth_path = '../../dataset/table_data/liver_disorders/liver_disorders_Data_ground_truth.csv'
-dataname='live_disorder'
-
-# data_path = '../../dataset/table_data/adult/adult_new.csv'
-# ground_truth_path = '../../dataset/table_data/liver_disorders/liver_disorders_Data_ground_truth.csv'
-# dataname='adult'
-
-# data_path = '../../dataset/table_data/arrhythmia/arrhythmia.csv'
-# ground_truth_path = '../../dataset/table_data/liver_disorders/liver_disorders_Data_ground_truth.csv'
-# dataname='arrhythmia'
-
-def test_PC(data_path, ground_truth_path, dataname):
+def test_PC(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     data_list = []
     for index, row in data.iterrows():
@@ -52,15 +32,15 @@ def test_PC(data_path, ground_truth_path, dataname):
     pc.learn(data_list)
     est_graph = pc.causal_matrix
     print(est_graph)
-    np.save(f'./result/{dataname}/pc.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/pc.npy')
+    np.save(f'./result/{data_name}/pc.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/pc.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("pc",metrics.metrics)
     print("pc")
     # MetricGenenral(est_graph,true_dag)
 
 
-def test_notears(data_path, ground_truth_path, dataname):
+def test_notears(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     data_list = []
     for index, row in data.iterrows():
@@ -77,15 +57,15 @@ def test_notears(data_path, ground_truth_path, dataname):
     n.learn(data_list)
     est_graph = n.causal_matrix
     print(est_graph)
-    np.save(f'./result/{dataname}/notears.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/notears.npy')
+    np.save(f'./result/{data_name}/notears.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/notears.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("notears",metrics.metrics)
     print("notears")
     # MetricGenenral(est_graph, true_dag)
 
 
-def test_ica(data_path, ground_truth_path, dataname):
+def test_ica(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     data_list = []
     for index, row in data.iterrows():
@@ -102,15 +82,15 @@ def test_ica(data_path, ground_truth_path, dataname):
     n.learn(data_list)
     est_graph = n.causal_matrix
     print(est_graph)
-    np.save(f'./result/{dataname}/ica.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/ica.npy')
+    np.save(f'./result/{data_name}/ica.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/ica.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("ica",metrics.metrics)
     print("ica")
     # MetricGenenral(est_graph, true_dag)
 
 
-def test_direct(data_path, ground_truth_path, dataname):
+def test_direct(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     data_list = []
     for index, row in data.iterrows():
@@ -127,15 +107,15 @@ def test_direct(data_path, ground_truth_path, dataname):
     n.learn(data_list)
     est_graph = n.causal_matrix
     print(est_graph)
-    np.save(f'./result/{dataname}/direct.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/direct.npy')
+    np.save(f'./result/{data_name}/direct.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/direct.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("direct",metrics.metrics)
     print("direct")
     # MetricGenenral(est_graph, true_dag)
 
 
-def test_rl(data_path, ground_truth_path, dataname):
+def test_rl(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     data_list = []
     for index, row in data.iterrows():
@@ -153,15 +133,15 @@ def test_rl(data_path, ground_truth_path, dataname):
     n.learn(data_list)
     est_graph = n.causal_matrix
     print(est_graph)
-    np.save(f'./result/{dataname}/rl.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/rl.npy')
+    np.save(f'./result/{data_name}/rl.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/rl.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("rl", metrics.metrics)
     print("rl")
     # MetricGenenral(est_graph, true_dag)
 
 
-def test_sdcd(data_path, ground_truth_path, dataname):
+def test_sdcd(data_path, ground_truth_path, data_name):
     data = pd.read_csv(data_path, encoding='utf-8')
     # data = data.astype('float64')
     print(data.head())
@@ -180,17 +160,17 @@ def test_sdcd(data_path, ground_truth_path, dataname):
     est_graph = model.get_adjacency_matrix(threshold=True)
 
     print(est_graph)
-    np.save(f'./result/{dataname}/sdcd.npy', est_graph)
-    est_graph = np.load(f'./result/{dataname}/sdcd.npy')
+    np.save(f'./result/{data_name}/sdcd.npy', est_graph)
+    est_graph = np.load(f'./result/{data_name}/sdcd.npy')
     # metrics = MetricsDAG(est_graph, true_dag)
     # print("rl", metrics.metrics)
     print("sdcd")
     MetricGenenral(est_graph, true_dag)
 
 
-# test_PC(data_path, ground_truth_path, dataname)
-# test_notears(data_path, ground_truth_path, dataname)
-# test_ica(data_path, ground_truth_path, dataname)
-# test_direct(data_path, ground_truth_path, dataname)
-# test_rl(data_path, ground_truth_path, dataname)
-test_sdcd(data_path, ground_truth_path, dataname)
+# test_PC(data_path, ground_truth_path, data_name)
+# test_notears(data_path, ground_truth_path, data_name)
+# test_ica(data_path, ground_truth_path, data_name)
+# test_direct(data_path, ground_truth_path, data_name)
+# test_rl(data_path, ground_truth_path, data_name)
+test_sdcd(data_path, ground_truth_path, data_name)
