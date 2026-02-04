@@ -1,24 +1,47 @@
+import sys
+import os
+# 将项目根目录添加到 sys.path
+# __file__ 是 counter.py 的路径
+# os.path.dirname(__file__) 是 .../algorithm/counter
+# os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')) 是 .../Causal_Discovery
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+nice_package_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'NICE'))
+sys.path.insert(0, project_root)
+sys.path.insert(0, nice_package_path)
+
 from pmlb import fetch_data
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from xgboost import XGBClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from pytorch_tabnet.tab_model import TabNetClassifier, TabNetRegressor
+from tabpfn import TabPFNClassifier
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.pipeline import Pipeline
-from nice import NICE
+from algorithm.NICE.nice import NICE
 import pandas as pd
 import numpy as np
 import torch
 from tqdm import tqdm
 
-
 # load data
 # data_path = '../../dataset/table_data/auto-mpg/Auto-mpg_Data_new.csv'
-# data = pd.read_csv(data_path, encoding="utf")
+data_path = '../../dataset/table_data/adult/adult_new.csv'
+# data_path = '../../dataset/table_data/Abalone/Abalone_Data_new.csv'
+# data_path = '../../dataset/table_data/CCS/CCS_Data_new.csv'
+# data_path = '../../dataset/table_data/liver_disorders/liver_disorder_Data_new.csv'
+# data_path = '../../dataset/table_data/arrhythmia/arrhythmia_new.csv'
+data = pd.read_csv(data_path, encoding="utf")
+
+
 # data_path = '../../dataset/travel/tob.csv'
 # data = pd.read_csv(data_path, encoding="gbk")
 
 
-def test_feature(data, results, target_feature, graph,function):
+def test_feature(data, results, target_feature, graph, function):
     data_l = 'adult'
     labels = data.columns
     inputs = []
@@ -28,7 +51,8 @@ def test_feature(data, results, target_feature, graph,function):
     X = np.array(inputs)
     y = np.array(results)
 
-    X = np.array([X_norm_item * graph for X_norm_item in X])
+    # X = np.array([X_norm_item * graph for X_norm_item in X])
+    X = np.array(X * graph)
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
@@ -38,10 +62,10 @@ def test_feature(data, results, target_feature, graph,function):
 
     # cat_labels = []  # ccs
     # cat_labels.remove(target_feature)  # test_cat_feature need do this
-    if target_feature in cat_labels:
-        cat_labels.remove(target_feature)
+    # if target_feature in cat_labels:
+    #     cat_labels.remove(target_feature)
     cat_feat = [np.where(labels == label)[0][0] for label in cat_labels]  # first
-    # cat_feat = [] # second
+    # cat_feat = []  # second
 
     # num_labels = []  # ccs
     # # cat_labels.remove(target_feature)  # test_cat_feature need do this
@@ -71,7 +95,7 @@ def test_feature(data, results, target_feature, graph,function):
         ('PP', ColumnTransformer([
             ('num', StandardScaler(), num_feat),
             ('cat', OneHotEncoder(handle_unknown='ignore'), cat_feat)])),
-        ('RF', RandomForestClassifier())])
+        ('RF', MLPClassifier(hidden_layer_sizes=(100,), max_iter=300, random_state=42))])
 
     clf.fit(X_train, y_train)
 
@@ -145,7 +169,7 @@ def test_feature(data, results, target_feature, graph,function):
         ('PP', ColumnTransformer([
             ('num', StandardScaler(), num_feat),
             ('cat', OneHotEncoder(handle_unknown='ignore'), cat_feat)])),
-        ('RF', RandomForestClassifier())])
+        ('RF', MLPClassifier(hidden_layer_sizes=(100,), max_iter=300, random_state=42))])
 
     nn_clf.fit(np.array(eval_x_train), np.array(eval_y_train))
 
@@ -196,7 +220,7 @@ def test_num_features(data, graph, function):
     target_feature = all_labels[-1]
     new_data = data.drop(labels=target_feature, axis=1)
     results = list(data[target_feature])
-    dispo=test_feature(new_data, results, target_feature, graph, function)
+    dispo = test_feature(new_data, results, target_feature, graph, function)
     return dispo
     '''
     for i in range(-5, 0):
@@ -210,4 +234,16 @@ def test_num_features(data, graph, function):
         test_feature(new_data, results, target_feature)
     '''
 
-# test_num_features(data)
+
+'''
+dataname = 'adult'
+graph = np.load(f'./result/{dataname}/rl.npy')
+# graph = np.load(f'./result/{dataname}/direct.npy')
+# graph = np.load(f'./result/{dataname}/ica.npy')
+# graph = np.load(f'./result/{dataname}/notears.npy')
+# graph = np.load(f'./result/{dataname}/pc.npy')
+graph_new = graph[-1, :-1]
+print(graph, graph_new)
+function = []
+test_num_features(data, graph_new, function)
+'''
