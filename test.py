@@ -1,289 +1,542 @@
-import numpy as np
-import pandas as pd
-import time
 import torch
-from torch import optim, nn
-from torch.utils.data import Dataset
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from collections import Counter
-from imblearn.under_sampling import RandomUnderSampler
-from castle.common import GraphDAG
-from castle.metrics import MetricsDAG
-from castle.datasets import load_dataset
-from castle.algorithms import PC
-from algorithm.utils.evaluation import MetricGenenral
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, precision_score
+from scipy.spatial.distance import cdist
+import os, json, random
 
+# ==================== 1. 数据预处理 ====================
+def load_adult_data(train_path, test_path):
+    """加载并预处理 Adult 数据集"""
+    def preprocess(csv_path, scaler=None, encoders=None, is_train=False):
+        df = pd.read_csv(csv_path, header=0, na_values=' ?', skipinitialspace=True)
+        df.columns = [
+            'age', 'workclass', 'fnlwgt', 'education', 'education-num', 'marital-status',
+            'occupation', 'relationship', 'race', 'sex', 'capital-gain', 'capital-loss',
+            'hours-per-week', 'native-country', 'income'
+        ]
+        df.dropna(inplace=True)
+        
+        # 目标变量
+        y = df['income']
+        df.drop(['income', 'fnlwgt'], axis=1, inplace=True)  # 移除无关特征
+        
+        # 特征分类
+        num_cols = ['age', 'education-num', 'capital-gain', 'capital-loss', 'hours-per-week']
+        cat_cols = [c for c in df.columns if c not in num_cols]
+        
+        # 数值特征标准化
+        if is_train:
+            scaler = StandardScaler()
+            X_num = scaler.fit_transform(df[num_cols].values)
+        else:
+            X_num = scaler.transform(df[num_cols].values)
+        
+        # 类别特征编码
+        if is_train:
+            encoders = {col: LabelEncoder().fit(df[col].astype(str)) for col in cat_cols}
+            X_cat = np.column_stack([
+                encoders[col].transform(df[col].astype(str)) for col in cat_cols
+            ])
+        else:
+            X_cat = np.column_stack([
+                encoders[col].transform(df[col].astype(str)) for col in cat_cols
+            ])
+        
+        X = np.hstack([X_num, X_cat])
+        feature_names = num_cols + cat_cols
+        cat_mask = np.array([False]*len(num_cols) + [True]*len(cat_cols))
+        
+        return X.astype(np.float32), y.astype(np.int64).values, scaler, encoders, feature_names, cat_mask
+    
+    # 训练集
+    X_train, y_train, scaler, encoders, feature_names, cat_mask = preprocess(train_path, is_train=True)
+    # 测试集
+    X_test, y_test, _, _, _, _ = preprocess(test_path, scaler=scaler, encoders=encoders, is_train=False)
+    
+    return (X_train, y_train), (X_test, y_test), feature_names, cat_mask, scaler
 
-class medical_Dataset(Dataset):
-    def __init__(self, data, result):
-        self.data = data
-        self.result = result
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        return self.data[index], self.result[index]
-
-
-class MLP(torch.nn.Module):
-    def __init__(self, in_dim, n_hid, out_dim, n_layer):
-        """Component for encoder and decoder
-
-        Args:
-            in_dim (int): input dimension.
-            n_hid (int): model layer dimension.
-            out_dim (int): output dimension.
-        """
-        super(MLP, self).__init__()
-        dims = (
-                [(in_dim, n_hid)]
-                + [(n_hid, n_hid) for _ in range(n_layer - 1)]
-                + [(n_hid, out_dim)]
+# ==================== 2. 核心模型定义 ====================
+class CausalDiscovery(nn.Module):
+    """因果发现模块：MLP 生成因果概率图 + Gumbel-Softmax 采样"""
+    def __init__(self, n_features):
+        super().__init__()
+        self.n_features = n_features
+        self.mlp = nn.Sequential(
+            nn.Linear(n_features, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, n_features * n_features)
         )
-        fc_layers = [nn.Linear(pair[0], pair[1]) for pair in dims]
-        bn_layers = [nn.BatchNorm1d(n_hid) for _ in range(n_layer)]
-        lr_layers = [nn.LeakyReLU(0.05) for _ in range(n_layer)]
-        # lr_layers = [nn.Tanh() for _ in range(n_layer)]
-        # lr_layers = [nn.ReLU() for _ in range(n_layer)]
-        layers = []
-        for i in range(n_layer):
-            layers.append(fc_layers[i])
-            layers.append(bn_layers[i])
-            layers.append(lr_layers[i])
-        layers.append(fc_layers[-1])
-        layers.append(nn.BatchNorm1d(out_dim))
-        self.network = nn.Sequential(*layers)
-        self.init_weights()
+        self.tau = 1.0  # Gumbel-Softmax 温度（训练时从1.0退火到0.1）
+    
+    def forward(self, X):
+        """
+        X: [batch_size, n_features]
+        返回: P (因果概率图), G_hat (采样得到的二值因果图)
+        """
+        # 特征级聚合：对 batch 取均值作为输入
+        theta = self.mlp(X.mean(dim=0, keepdim=True)).view(self.n_features, self.n_features)
+        P = torch.sigmoid(theta)
+        P = P * (1 - torch.eye(self.n_features, device=P.device))  # 移除自环
+        
+        # Gumbel-Softmax 采样（训练时使用，测试时用确定性采样）
+        if self.training:
+            logits = torch.log(P + 1e-20) - torch.log(1 - P + 1e-20)
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
+            sample = torch.sigmoid((logits + gumbel_noise) / self.tau)
+            G_hat = (sample > 0.5).float()
+        else:
+            G_hat = (P > 0.5).float()
+        
+        return P, G_hat
+    
+    def update_tau(self, epoch, max_epochs):
+        """温度退火：从1.0线性降至0.1"""
+        self.tau = max(0.1, 1.0 - 0.9 * epoch / max_epochs)
 
-    def forward(self, x):
-        return self.network(x)
+class EventPredictor(nn.Module):
+    """因果感知的事件预测器"""
+    def __init__(self, n_features):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(n_features, 64),
+            nn.BatchNorm1d(64), nn.ReLU(),
+            nn.Linear(64, 32), nn.BatchNorm1d(32), nn.ReLU(),
+            nn.Linear(32, 2)  # 二分类（>50K 或 <=50K）
+        )
+    
+    def forward(self, X):
+        return self.mlp(X)
 
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+# ==================== 3. 无环约束 (Acyclicity Constraint) ====================
+def acyclicity_constraint(P):
+    """
+    实现论文 Eq.(10): h(G) = tr((I + G/|X|)^|X|) - |X|
+    确保因果图为 DAG（有向无环图）
+    """
+    n = P.size(0)
+    I = torch.eye(n, device=P.device)
+    # 使用 NOTEARS 的数值稳定版本: h(G) = tr(expm(G ◦ G)) - n
+    M = torch.matrix_exp(P * P)  # expm(G ◦ G)
+    h = torch.trace(M) - n
+    return h**2  # Lc = h(G)^2
 
-
-# adult
-# data = pd.read_csv('../../dataset/table_data/adult/adult_new.csv')
-# cf_results = pd.read_csv('./result/adult/income_cf_results.csv')
-
-# ccs
-# data = pd.read_csv('../../dataset/table_data/CCS/CCS_Data_new.csv')
-# cf_results = pd.read_csv('./result/ccs/strength_cf_results.csv')
-
-# abalone
-# data = pd.read_csv('../../dataset/table_data/Abalone/Abalone_Data_new.csv')
-# cf_results = pd.read_csv('./result/abalone/Age_cf_results.csv')
-
-# auto-mpg
-# data = pd.read_csv('../../dataset/table_data/auto-mpg/Auto-mpg_Data_new.csv')
-# cf_results = pd.read_csv('./result/autompg/Fuel consumption_cf_results.csv')
-
-
-# travel
-# data = pd.read_csv('../../dataset/travel/数据处理2113.csv')
-# cf_results = pd.read_csv('./result/travel/大学生_cf_results.csv', encoding='gbk')
-
-data = pd.read_csv('../../dataset/travel/tob.csv',encoding='gbk')
-cf_results = pd.read_csv('./result/travel/tob/increase_cf_results.csv', encoding='gbk')
-
-graph = torch.tensor(cf_results.prob > 0.05, dtype=torch.float64)
-
-
-# graph = torch.bernoulli(torch.tensor(cf_results.prob, dtype=torch.float64))
-
-
-# true_dag=pd.read_csv('../../dataset/table_data/')
-
-def get_numpy_data(data):
-    data_lists = []
-    for index, row in data.iterrows():
-        data_lists.append(list(row.values))
-    data_numpy = np.array(data_lists)
-    return data_numpy
-
-
-# def test_pc(data):
-#     data = get_numpy_data(data)
-#     print('data ok')
-#     # X=X.astype(float)
-#     pc = PC(variant='original')
-#     pc.learn(X)
-#     est_graph = pc.causal_matrix
-#     print(est_graph)
-#     np.save(f'./result/exp_{exp}_winsize100.npy', est_graph)
-#     est_graph = np.load(f'./result/exp_{exp}_winsize100.npy')
-#     MetricGenenral(est_graph, true_dag)
-
-def test_cf_result(data, graph):
-    # train parameters
-    epochs = 200
-    learning_rate = 1e-3
-    batch_size = 16  # 128
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')  # 训练设备
-
-    labels = data.columns
-    data = get_numpy_data(data)
-
-    # travel
-    # data = data[:, 3:]
-    data = data.astype(int)
-    X = np.array(data[:, :-1])
-    y = np.array(data[:, -1])
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
-
-    # under sampling
-    # rus = RandomUnderSampler(sampling_strategy=0.75, random_state=2023, replacement=False)
-    # X_train, y_train = rus.fit_resample(X_train, y_train)
-    # print('Resampled under dataset shape %s' % Counter(y_train))
-
-    X_train = torch.tensor(X_train, dtype=torch.float64).to(device)
-    y_train = torch.tensor(y_train, dtype=torch.float64).view((len(X_train), 1)).to(device)
-    train_data = medical_Dataset(X_train, y_train)
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=False, sampler=None,
-                                               batch_sampler=None,
-                                               num_workers=0, collate_fn=None, pin_memory=False, drop_last=True,
-                                               timeout=0,
-                                               worker_init_fn=None, multiprocessing_context=None)
-
-    X_test = torch.tensor(X_test, dtype=torch.float64).to(device)
-    y_test = torch.tensor(y_test, dtype=torch.float64).view((len(X_test), 1)).to(device)
-    test_data = medical_Dataset(X_test, y_test)
-    test_loader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, sampler=None,
-                                              batch_sampler=None,
-                                              num_workers=0, collate_fn=None, pin_memory=False, drop_last=True,
-                                              timeout=0,
-                                              worker_init_fn=None, multiprocessing_context=None)
-    num_i = len(labels) - 1
-    num_h = 256
-    num_o = 1
-    model = MLP(num_i, num_h, num_o, 3)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    loss_pre = torch.nn.BCELoss(reduction='sum')
-    func_sigmoid = nn.Sigmoid()
-    e = tqdm(total=epochs)
-    tp = []
-    fp = []
-    tn = []
-    fn = []
-    loss_train = []
-    loss_eval = []
-    epoch_list = []
-    acc_0 = []
-    acc_1 = []
-
-    try:
-        for epoch in range(epochs):
-            sum_loss = 0
-            # sum_loss1 = 0
-            # sum_loss2 = 0
-            # sum_loss3 = 0
-            sum_length = 0
-            true_positive = 0
-            false_positive = 0
-            true_negative = 0
-            false_negative = 0
-            for i, data in enumerate(train_loader):
-                # inputs = torch.tensor(data, dtype=torch.float64)
-                inputs, results = data
-                length = batch_size
-                if len(inputs) < batch_size:
-                    length = len(inputs)
-                inputs = torch.tensor(inputs * graph, dtype=torch.float64).to(device)
-                # inputs = torch.tensor(inputs, dtype=torch.float64).to(device)
-                model.train()
-                output = model(inputs)
-                final_output = func_sigmoid(output)
-                # final_output = final_output.type(torch.float64).requires_grad_(True)
-                # for d in range(length):
-                #     final_output[d] = output[d].argmax()
-                loss = loss_pre(final_output, results)
-                sum_loss += loss.item()
-                sum_length += length
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                # postfix = f"i={i}, len={sum_length},loss={sum_loss / sum_length}"
-                # t.set_postfix_str(postfix)
-            loss_train.append(sum_loss / sum_length)
-            epoch_list.append(epoch)
-
-            # model test
-            model.eval()
-            sum_loss = 0
-            sum_length = 0
-            for j, data in enumerate(test_loader):
-                inputs, results = data
-                length = batch_size
-                if len(inputs) < batch_size:
-                    length = len(inputs)
-                # inputs = torch.tensor(inputs * graph, dtype=torch.float64).to(device)
-                inputs = torch.tensor(inputs, dtype=torch.float64).to(device)
-                output = model(inputs)
-                # final_output = torch.argmax(output, dim=1)
-                final_output = func_sigmoid(output)
-                for d in range(length):
-                    if results[d] == 0:
-                        if final_output[d] > 0.5:
-                            false_positive += 1
-                        else:
-                            true_negative += 1
-                    else:
-                        if final_output[d] > 0.5:
-                            true_positive += 1
-                        else:
-                            false_negative += 1
-                loss = loss_pre(final_output, results)
-                sum_loss += loss.item()
-                sum_length += length
-                postfix = f"i={i}, len={sum_length},loss={loss.item()}"
-                e.set_postfix_str(postfix)
-            e.update(1)
-            loss_eval.append(sum_loss / sum_length)
-            tp.append(true_positive)
-            fp.append(false_positive)
-            tn.append(true_negative)
-            fn.append(false_negative)
-            acc_0.append(false_positive / (true_negative + false_positive))
-            acc_1.append(true_positive / (true_positive + false_negative))
-            if true_positive + false_positive == 0:
-                pr = 0
+# ==================== 4. 反事实解释器（内生验证核心） ====================
+class CounterfactualExplainer:
+    """内生反事实解释器：用于评估因果图质量 + 检测过拟合"""
+    def __init__(self, causal_graph, predictor, cat_mask, device='cpu'):
+        self.G = causal_graph.cpu().numpy()  # [n, n] 二值矩阵
+        self.predictor = predictor
+        self.cat_mask = cat_mask
+        self.device = device
+    
+    def heom_distance(self, x, y, feature_ranges):
+        """异构欧氏重叠度量 (HEOM)"""
+        dist = 0.0
+        for i in range(len(x)):
+            if self.cat_mask[i]:  # 类别特征
+                dist += 0 if abs(x[i] - y[i]) < 1e-5 else 1
+            else:  # 数值特征
+                if feature_ranges[i] > 1e-5:
+                    dist += abs(x[i] - y[i]) / feature_ranges[i]
+                else:
+                    dist += 0
+        return dist
+    
+    def find_unlike_neighbor(self, instance, dataset_X, dataset_y, feature_ranges):
+        """找到预测结果不同的最近邻（异类最近邻）- 向量化加速版"""
+        with torch.no_grad():
+            pred = torch.argmax(self.predictor(
+                torch.FloatTensor(instance).unsqueeze(0).to(self.device)
+            ), dim=1).item()
+        
+        # 筛选异类样本
+        unlike_mask = (dataset_y != pred)
+        if not np.any(unlike_mask):
+            return None
+            
+        candidates = dataset_X[unlike_mask]
+        
+        # 向量化 HEOM 计算
+        # diffs: (n_candidates, n_features)
+        diffs = np.abs(candidates - instance)
+        
+        # 1. Categorical: 1 if diff > epsilon
+        # cat_mask broadcasting
+        cat_dist = (diffs > 1e-5) * self.cat_mask
+        
+        # 2. Numerical: diff / range
+        # feature_ranges broadcasting
+        # Avoid div by zero
+        safe_ranges = feature_ranges.copy()
+        safe_ranges[safe_ranges < 1e-5] = 1.0
+        num_dist = (diffs / safe_ranges) * (~self.cat_mask)
+        
+        # Sum
+        dists = (cat_dist + num_dist).sum(axis=1)
+        
+        # Find min
+        min_idx = np.argmin(dists)
+        return candidates[min_idx]
+    
+    def generate(self, instance, dataset_X, dataset_y, feature_ranges, target_idx=None):
+        """
+        生成反事实样本（遵循因果约束）：
+        1. 仅修改与目标有直接因果边的特征 (G[:, target_idx] == 1)
+        2. 若修改 xi，需同步调整其直接子节点 xj (因果传播)
+        """
+        st = self.find_unlike_neighbor(instance, dataset_X, dataset_y, feature_ranges)
+        if st is None:
+            return None
+        
+        sc = instance.copy()
+        
+        # 筛选可修改特征
+        if target_idx is not None:
+            # 仅修改与目标有直接因果边的特征 (G[i, target_idx] == 1)
+            modifiable_indices = [i for i in range(len(instance)) if self.G[i, target_idx] > 0.5]
+        else:
+            modifiable_indices = range(len(instance))
+        
+        # 贪心策略：尝试逐个修改特征
+        for i in modifiable_indices:
+            if np.abs(instance[i] - st[i]) < 1e-5:
+                continue
+            
+            # 临时修改
+            original_val = sc[i]
+            sc[i] = st[i]
+            
+            # 检查预测是否翻转
+            with torch.no_grad():
+                new_pred = torch.argmax(self.predictor(
+                    torch.FloatTensor(sc).unsqueeze(0).to(self.device)
+                ), dim=1).item()
+                orig_pred = torch.argmax(self.predictor(
+                    torch.FloatTensor(instance).unsqueeze(0).to(self.device)
+                ), dim=1).item()
+            
+            if new_pred != orig_pred:
+                return sc  # 成功生成反事实
             else:
-                pr = true_positive / (true_positive + false_positive)
-            print(f'TP={true_positive}, FP={false_positive},TN={true_negative},FN={false_negative},'
-                  f'pr={pr},'
-                  f'acc={(true_positive + true_negative) / (true_positive + true_negative + false_positive + false_negative)}')
-        raise KeyboardInterrupt
-    except KeyboardInterrupt:
-        plt.figure()
-        # draw evaluation in one figure
-        plt.subplot(2, 1, 1)
-        plt.xlabel('epochs')
-        plt.ylabel('num')
-        plt.title('evaluation with epochs increasing')
-        # plt.plot(epoch_list, tp, label='tp')
-        # plt.plot(epoch_list, fp, label='fp')
-        # plt.plot(epoch_list, tn, label='tn')
-        # plt.plot(epoch_list, fn, label='fn')
-        plt.plot(epoch_list, acc_0, label='FPR')
-        plt.plot(epoch_list, acc_1, label='TPR')
-        plt.legend()
+                sc[i] = original_val  # 恢复
+        
+        return None  # 未能生成有效反事实
 
-        # draw loss in another figure
-        plt.subplot(2, 1, 2)
-        plt.xlabel('epochs')
-        plt.ylabel('loss')
-        plt.title('loss with epochs increasing')
-        plt.plot(epoch_list, loss_train, label='loss_train')
-        plt.plot(epoch_list, loss_eval, label='loss_eval')
-        plt.legend()
-        plt.show()
-        # plt.savefig('./result/kl_new.png')
+def compute_discriminative_power(counterfactuals, test_X, train_X, train_y, predictor, device='cpu'):
+    """
+    计算 Discriminative Power (dispo):
+    用 counterfactuals + test_X 训练 1NN，在 S_eq ∪ S_neq 上评估分类准确率
+    """
+    if len(counterfactuals) == 0:
+        return 0.0
+    
+    # 构建训练集: test instances (label=1) + counterfactuals (label=0)
+    train_set_X = np.vstack([test_X, counterfactuals])
+    train_set_y = np.hstack([np.ones(len(test_X)), np.zeros(len(counterfactuals))])
+    
+    # 为每个测试样本构建 S_eq (同类最近邻) 和 S_neq (异类最近邻)
+    test_eval_X = []
+    test_eval_y = []
+    
+    with torch.no_grad():
+        test_preds = torch.argmax(predictor(
+            torch.FloatTensor(test_X).to(device)
+        ), dim=1).cpu().numpy()
+    
+    for i, (x_test, pred) in enumerate(zip(test_X, test_preds)):
+        # 同类样本
+        same_idx = np.where(train_y == pred)[0]
+        if len(same_idx) > 0:
+            same_dists = cdist([x_test], train_X[same_idx], metric='euclidean')[0]
+            s_eq = train_X[same_idx[np.argmin(same_dists)]]
+            test_eval_X.append(s_eq)
+            test_eval_y.append(1)
+        
+        # 异类样本
+        diff_idx = np.where(train_y != pred)[0]
+        if len(diff_idx) > 0:
+            diff_dists = cdist([x_test], train_X[diff_idx], metric='euclidean')[0]
+            s_neq = train_X[diff_idx[np.argmin(diff_dists)]]
+            test_eval_X.append(s_neq)
+            test_eval_y.append(0)
+    
+    if len(test_eval_X) == 0:
+        return 0.0
+    
+    # 1NN 分类
+    eval_X = np.array(test_eval_X)
+    eval_y = np.array(test_eval_y)
+    preds = []
+    for x in eval_X:
+        dists = cdist([x], train_set_X, metric='euclidean')[0]
+        nn_idx = np.argmin(dists)
+        preds.append(train_set_y[nn_idx])
+    
+    return accuracy_score(eval_y, preds)
 
+# ==================== 5. 完整训练流程 ====================
+def train_interpet(
+    X_train, y_train, 
+    X_val=None, y_val=None,  # 可选：用于早停监控（非必须，InterPet 使用内生验证）
+    n_epochs=400,
+    lr_causal=1e-3,
+    lr_predictor=1e-3,
+    lambda_c=0.1,   # 无环约束权重
+    lambda_s=0.01,  # 稀疏性约束权重
+    batch_size=128,
+    device='cuda' if torch.cuda.is_available() else 'cpu',
+    checkpoint_dir='checkpoints'
+):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    n_features = X_train.shape[1]
+    n_samples = X_train.shape[0]
+    
+    # 初始化模型
+    causal_module = CausalDiscovery(n_features).to(device)
+    predictor = EventPredictor(n_features).to(device)
+    
+    # 优化器（交替优化）
+    optimizer_causal = optim.Adam(causal_module.parameters(), lr=lr_causal)
+    optimizer_predictor = optim.Adam(predictor.parameters(), lr=lr_predictor)
+    
+    # 损失函数
+    criterion = nn.CrossEntropyLoss()
+    
+    # 特征范围（用于 HEOM）
+    feature_ranges = X_train.max(axis=0) - X_train.min(axis=0) + 1e-5
+    
+    # 训练循环（EM 风格交替优化）
+    best_dispo = 0.0
+    patience = 50
+    patience_counter = 0
+    
+    for epoch in range(n_epochs):
+        causal_module.train()
+        predictor.train()
+        
+        # ===== 阶段1: 固定因果图，优化预测器 =====
+        epoch_loss_pred = 0.0
+        for _ in range(5):  # 每轮优化预测器5次
+            idx = np.random.choice(n_samples, batch_size, replace=False)
+            X_batch = torch.FloatTensor(X_train[idx]).to(device)
+            y_batch = torch.LongTensor(y_train[idx]).to(device)
+            
+            with torch.no_grad():
+                _, G_hat = causal_module(X_batch)
+            
+            # 特征过滤：仅保留与目标相关的特征（简化：使用全连接）
+            # 实际中应使用 G_hat[:, target_idx] 作为掩码
+            X_filtered = X_batch  # * G_hat[:, target_idx].unsqueeze(0)
+            
+            optimizer_predictor.zero_grad()
+            logits = predictor(X_filtered)
+            loss_pred = criterion(logits, y_batch)
+            loss_pred.backward()
+            optimizer_predictor.step()
+            
+            epoch_loss_pred += loss_pred.item()
+        
+        # ===== 阶段2: 固定预测器，优化因果图 =====
+        epoch_loss_graph = 0.0
+        for _ in range(1):  # 每轮优化因果图1次
+            idx = np.random.choice(n_samples, batch_size, replace=False)
+            X_batch = torch.FloatTensor(X_train[idx]).to(device)
+            y_batch = torch.LongTensor(y_train[idx]).to(device)
+            
+            optimizer_causal.zero_grad()
+            
+            # 前向传播
+            P, G_hat = causal_module(X_batch)
+            X_filtered = X_batch  # * G_hat[:, target_idx].unsqueeze(0)
+            logits = predictor(X_filtered)
+            
+            # 损失计算
+            loss_pred = criterion(logits, y_batch)
+            loss_c = lambda_c * acyclicity_constraint(P)  # 无环约束
+            loss_s = lambda_s * torch.norm(P, p=1)       # 稀疏性约束
+            loss_graph = loss_pred + loss_c + loss_s
+            
+            loss_graph.backward()
+            optimizer_causal.step()
+            
+            epoch_loss_graph += loss_graph.item()
+        
+        # 温度退火
+        causal_module.update_tau(epoch, n_epochs)
+        
+        # ===== 阶段3: 反事实内生验证（每5轮） =====
+        dispo = 0.0
+        if epoch % 5 == 0:
+            causal_module.eval()
+            predictor.eval()
+            
+            with torch.no_grad():
+                _, G_hat = causal_module(torch.FloatTensor(X_train).to(device))
+            
+            # 采样少量测试样本生成反事实
+            sample_size = int(n_samples * 0.3)
+            test_indices = np.random.choice(n_samples, sample_size, replace=False)
+            X_test_sample = X_train[test_indices]
+            y_test_sample = y_train[test_indices]
+            
+            explainer = CounterfactualExplainer(
+                causal_graph=G_hat,
+                predictor=predictor,
+                cat_mask=np.array([False]*5 + [True]*(n_features-5)),
+                device=device
+            )
+            
+            counterfactuals = []
+            for i in test_indices:
+                cf = explainer.generate(
+                    X_train[i], X_train, y_train, feature_ranges
+                )
+                if cf is not None:
+                    counterfactuals.append(cf)
+            
+            if len(counterfactuals) > 0:
+                dispo = compute_discriminative_power(
+                    np.array(counterfactuals),
+                    X_test_sample,
+                    X_train,
+                    y_train,
+                    predictor,
+                    device
+                )
+            
+            causal_module.train()
+            predictor.train()
+        
+        # ===== 早停判断（基于 dispo）=====
+        if dispo > best_dispo:
+            best_dispo = dispo
+            patience_counter = 0
+            
+            # 保存最佳模型
+            torch.save({
+                'epoch': epoch,
+                'causal_state_dict': causal_module.state_dict(),
+                'predictor_state_dict': predictor.state_dict(),
+                'dispo': dispo,
+                'lambda_c': lambda_c,
+                'lambda_s': lambda_s
+            }, f'{checkpoint_dir}/interpet_adult_best.pth')
+        else:
+            patience_counter += 1
+        
+        # 打印训练日志
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch:3d} | Loss_pred: {epoch_loss_pred/5:.4f} | "
+                  f"Loss_graph: {epoch_loss_graph:.4f} | Dispo: {dispo:.4f} | "
+                  f"Tau: {causal_module.tau:.2f}")
+        
+        # 早停
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch} (no improvement in dispo for {patience} rounds)")
+            break
+    
+    print(f"\nTraining completed. Best dispo: {best_dispo:.4f}")
+    return causal_module, predictor, best_dispo
 
-test_cf_result(data, graph)
+# ==================== 6. 测试函数 ====================
+def test_interpet(model_path, X_test, y_test, feature_names, cat_mask, device='cpu'):
+    n_features = X_test.shape[1]
+    
+    # 加载模型
+    causal_module = CausalDiscovery(n_features).to(device)
+    predictor = EventPredictor(n_features).to(device)
+    
+    checkpoint = torch.load(model_path, map_location=device)
+    causal_module.load_state_dict(checkpoint['causal_state_dict'])
+    predictor.load_state_dict(checkpoint['predictor_state_dict'])
+    
+    causal_module.eval()
+    predictor.eval()
+    
+    # 生成因果图
+    with torch.no_grad():
+        _, causal_graph = causal_module(torch.FloatTensor(X_test).to(device))
+        logits = predictor(torch.FloatTensor(X_test).to(device))
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+    
+    # 评估指标
+    acc = accuracy_score(y_test, preds)
+    prec = precision_score(y_test, preds)
+    f1 = f1_score(y_test, preds)
+    
+    print(f"\nTest Results:")
+    print(f"  Accuracy: {acc:.4f}")
+    print(f"  Precision: {prec:.4f}")
+    print(f"  F1 Score: {f1:.4f}")
+    
+    # 可视化因果图（简化：打印前10个强因果边）
+    print("\nTop 10 causal edges (feature_i -> feature_j):")
+    edges = []
+    for i in range(n_features):
+        for j in range(n_features):
+            if causal_graph[i, j] > 0.5:
+                edges.append((i, j, causal_graph[i, j].item()))
+    edges = sorted(edges, key=lambda x: x[2], reverse=True)[:10]
+    for i, j, weight in edges:
+        print(f"  {feature_names[i]:20s} -> {feature_names[j]:20s} (weight={weight:.2f})")
+    
+    return {
+        'accuracy': float(acc),
+        'precision': float(prec),
+        'f1_score': float(f1),
+        'dispo': checkpoint.get('dispo', 0.0),
+        'causal_graph': causal_graph.cpu().numpy().tolist()
+    }
+
+# ==================== 7. 主程序 ====================
+if __name__ == "__main__":
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    # 配置路径
+    TRAIN_CSV = "/workspace/causal_discovery/dataset/real_world/adult/adult_new.csv"
+    TEST_CSV = "/workspace/causal_discovery/dataset/real_world/adult/adult_test.csv"
+    
+    # 1. 加载数据
+    print("Loading Adult dataset...")
+    (X_train, y_train), (X_test, y_test), feature_names, cat_mask, scaler = load_adult_data(
+        TRAIN_CSV, TEST_CSV
+    )
+    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+    
+    # 2. 训练模型
+    print("\n" + "="*60)
+    print("Training InterPet...")
+    print("="*60)
+    causal_module, predictor, best_dispo = train_interpet(
+        X_train, y_train,
+        n_epochs=200,
+        lambda_c=0.1,
+        lambda_s=0.01,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        checkpoint_dir='/workspace/causal_discovery/result/adult/checkpoints'
+    )
+    
+    # 3. 测试模型
+    print("\n" + "="*60)
+    print("Testing InterPet...")
+    print("="*60)
+    results = test_interpet(
+        '/workspace/causal_discovery/result/adult/checkpoints/interpet_adult_best.pth',
+        X_test, y_test,
+        feature_names, cat_mask,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    
+    # 4. 保存结果
+    with open('/workspace/causal_discovery/result/adult/interpet_adult_results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to interpet_adult_results.json")

@@ -272,6 +272,7 @@ if __name__ == "__main__":
     # 创建模型
     model = MLP(len(all_labels) - 1, 1024, 1, 3).to(device)
     func_sigmoid = nn.Sigmoid()
+    loss_LC = lambda G, num_v: torch.trace(torch.matrix_power((torch.eye(num_v) + G / num_v), num_v)) - num_v
     graph = nn.Parameter(torch.ones([len(all_labels) - 1]).to(device))
     # init_graph = torch.zeros_like(prior_graph).to(device)
     # init_graph[torch.where(prior_graph==1)] = 99
@@ -406,7 +407,8 @@ if __name__ == "__main__":
             # Y = Y.squeeze()
             likelihood = loss_fn(logits, Y)
             l1_norm = torch.norm(func_sigmoid(graph))
-            loss = loss_fn(logits, Y) + 0.1 * l1_norm
+            l_c = loss_LC(graph, len(all_labels))
+            loss = loss_fn(logits, Y) + 0.1 * l1_norm + 0.1 * l_c
             # loss = loss_fn(logits, Y) + 0.1*l1_norm
 
             # 反向传播和梯度下降
@@ -431,20 +433,7 @@ if __name__ == "__main__":
         spr = torch.norm(func_sigmoid(graph)) / graph.shape[0]
         edges = torch.sum(func_sigmoid(graph) > 0.5)
         est_graph = (func_sigmoid(graph) > 0.5).cpu().numpy()
-        # tp, fp, tpr, fpr, precision, f1 = eval_graph(est_graph, true_graph)
-        # print(
-        #     'Epoch {} Train[M]: loss_mean={:.4f}, acc_mean={:.4f}, acc_pos_mean={:.4f}, acc_neg_mean={:.4f}, spr={:.4f}, edges={:.4f}, tp={:.4f}'.format(
-        #         epoch_idx + 1, np.mean(loss_list), \
-        #         np.mean(acc_list), np.mean(acc_pos_list), np.mean(acc_neg_list), spr, edges, tp))
-        # tensorboard_log.log_metrics({"Train[M]/loss_mean": np.mean(loss_list),
-        #                              "Train[M]/acc_mean": np.mean(acc_list),
-        #                              "Train[M]/acc_pos_mean": np.mean(acc_pos_list),
-        #                              "Train[M]/acc_neg_mean": np.mean(acc_neg_list),
-        #                              "Train[M]/spr": spr,
-        #                              "Train[M]/edges": edges,
-        #                              "Train[M]/tp": tp,
-        #                              "Train[M]/fp": fp,
-        #                              }, epoch_idx + 1)
+
 
         # Stage3: 验证 - 反事实
         if np.sum(est_graph) == 0:
@@ -454,7 +443,7 @@ if __name__ == "__main__":
         if dispo > max_dispo:
             final_graph = est_graph
             torch.save(model.state_dict(), "./result/adult/model_weights.pth")
-            np.save('./result/adult/graph.npy',np.array(final_graph))
+            np.save('./result/adult/graph.npy', np.array(final_graph))
             max_dispo = dispo
         # Lr schedule
         # model_scheduler.step()
